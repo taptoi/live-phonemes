@@ -16,6 +16,7 @@ import queue
 import sys
 from dataclasses import dataclass
 from typing import Iterable, Optional
+from datasets import load_dataset
 
 import numpy as np
 import torch
@@ -29,8 +30,10 @@ except ImportError as exc:  # pragma: no cover - dependency not installed
 
 MODEL_NAME = "facebook/wav2vec2-lv-60-espeak-cv-ft"
 TARGET_SAMPLE_RATE = 16_000
-DEFAULT_MIC_CHUNK_SECONDS = 0.75
+DEFAULT_MIC_CHUNK_SECONDS = 0.6
 DEFAULT_SILENCE_THRESHOLD = 8e-4
+DEFAULT_FILE_CHUNK_SECONDS = 0.5  # seconds
+DEFAULT_FILE_CHUNK_OVERLAP_SECONDS = 0.0  # seconds
 
 
 def pick_device(preferred: Optional[str] = None) -> torch.device:
@@ -119,11 +122,68 @@ class PhonemeRecognizer:
         return transcription[0]
 
     def transcribe_file(self, path: str) -> str:
-        """Load a file from disk and transcribe it."""
+        # ...existing code...
+        raise NotImplementedError("Use transcribe_file_chunked with chunking support.")
+
+    def transcribe_file_chunked(
+        self,
+        path: str,
+        chunk_seconds: float = DEFAULT_FILE_CHUNK_SECONDS,
+        overlap_seconds: float = DEFAULT_FILE_CHUNK_OVERLAP_SECONDS,
+        joiner: str = " ",
+    ) -> str:
+        """Transcribe a file by splitting it into (possibly overlapping) chunks.
+
+        Parameters
+        ----------
+        path: str
+            Path to the audio file.
+        chunk_seconds: float
+            Target size of each chunk in seconds. Default 0.2s.
+        overlap_seconds: float
+            Overlap between consecutive chunks in seconds. Default 0.0s.
+        joiner: str
+            String used to join per-chunk phoneme sequences.
+        """
         if not os.path.exists(path):
             raise FileNotFoundError(path)
+        if chunk_seconds <= 0:
+            raise ValueError("chunk_seconds must be > 0")
+        if overlap_seconds < 0:
+            raise ValueError("overlap_seconds must be >= 0")
+        if overlap_seconds >= chunk_seconds:
+            raise ValueError("overlap_seconds must be smaller than chunk_seconds")
+
         audio, sample_rate = sf.read(path, dtype="float32")
-        return self.transcribe_array(audio, sample_rate)
+        # Ensure mono and resample once for efficiency
+        audio = self._ensure_mono(audio)
+        if sample_rate != TARGET_SAMPLE_RATE:
+            audio = self._resample(audio, sample_rate)
+            sample_rate = TARGET_SAMPLE_RATE
+
+        chunk_frames = int(round(chunk_seconds * sample_rate))
+        overlap_frames = int(round(overlap_seconds * sample_rate))
+        if chunk_frames <= 0:
+            raise ValueError("Computed chunk_frames <= 0; check chunk_seconds")
+        step = chunk_frames - overlap_frames if chunk_frames > overlap_frames else chunk_frames
+
+        results: list[str] = []
+        n = audio.shape[0]
+        for start in range(0, n, step):
+            end = min(start + chunk_frames, n)
+            chunk = audio[start:end]
+            if chunk.size == 0:
+                continue
+            # Skip near-silent chunks quickly
+            rms = math.sqrt(float(np.mean(chunk ** 2)))
+            if rms < 1e-5:  # conservative silence threshold for files
+                continue
+            text = self.transcribe_array(chunk, sample_rate).strip()
+            if text:
+                results.append(text)
+            if end == n:
+                break
+        return joiner.join(results)
 
     # ------------------------------------------------------------------
     # Demo helper
@@ -133,7 +193,7 @@ class PhonemeRecognizer:
         from datasets import load_dataset
 
         dataset = load_dataset(
-            "patrickvonplaten/librispeech_asr_dummy", "clean", split="validation"
+            "hf-internal-testing/librispeech_asr_dummy", "clean", split="validation"
         )
         audio = np.asarray(dataset[0]["audio"]["array"], dtype=np.float32)
         return self.transcribe_array(audio, TARGET_SAMPLE_RATE)
@@ -227,6 +287,18 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default=MODEL_NAME,
         help="Name of the Hugging Face model to download and run.",
     )
+    parser.add_argument(
+        "--file-chunk-seconds",
+        type=float,
+        default=DEFAULT_FILE_CHUNK_SECONDS,
+        help="Chunk size (seconds) for file transcription (default: 0.2).",
+    )
+    parser.add_argument(
+        "--file-chunk-overlap",
+        type=float,
+        default=DEFAULT_FILE_CHUNK_OVERLAP_SECONDS,
+        help="Overlap (seconds) between file chunks (default: 0.0).",
+    )
     return parser.parse_args(argv)
 
 
@@ -245,7 +317,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             print("--path is required in file mode", file=sys.stderr)
             return 2
         try:
-            transcription = recognizer.transcribe_file(args.path)
+            transcription = recognizer.transcribe_file_chunked(
+                args.path,
+                chunk_seconds=args.file_chunk_seconds,
+                overlap_seconds=args.file_chunk_overlap,
+            )
         except Exception as exc:  # pragma: no cover - runtime error
             print(f"Failed to transcribe file: {exc}", file=sys.stderr)
             return 1

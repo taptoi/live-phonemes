@@ -4,3 +4,7 @@ soundfile
 datasets
 transformers
 torch
+torchcodec
+scipy
+phonemizer
+protobuf

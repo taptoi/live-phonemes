@@ -81,3 +81,7 @@ Press <kbd>Ctrl</kbd> + <kbd>C</kbd> to stop streaming.
 - Ensure your microphone or input audio is sampled at 16kHz for the best
   results. The script resamples automatically but original 16kHz recordings
   minimise artifacts.
+
+## Debug
+- This was required:
+export PHONEMIZER_ESPEAK_LIBRARY=$(brew --prefix espeak-ng)/lib/libespeak-ng.dylib
