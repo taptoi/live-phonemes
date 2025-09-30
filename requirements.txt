@@ -1,0 +1,6 @@
+numpy
+sounddevice
+soundfile
+datasets
+transformers
+torch
