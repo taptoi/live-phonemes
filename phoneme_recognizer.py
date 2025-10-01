@@ -348,6 +348,98 @@ class PhonemeRecognizer:
         finally:
             srv.close()
 
+    # ------------------------------------------------------------------
+    # File real-time streaming (audible replay + phoneme output)
+    # ------------------------------------------------------------------
+    def stream_file(
+        self,
+        path: str,
+        chunk_seconds: float = DEFAULT_MIC_CHUNK_SECONDS,
+        silence_threshold: float = DEFAULT_SILENCE_THRESHOLD,
+        play_audio: bool = True,
+    ) -> None:
+        """Replay an audio file in (approximately) real-time and stream phoneme output.
+
+        Similar to microphone streaming but pulls data from a file. Audio is optionally
+        played back so the user can hear it while phonemes are printed.
+
+        Parameters
+        ----------
+        path: str
+            Audio file path.
+        chunk_seconds: float
+            Duration of each processing chunk (defaults to microphone chunk size).
+        silence_threshold: float
+            RMS threshold below which a chunk is skipped.
+        play_audio: bool
+            If True, audibly play the audio as it's processed.
+        """
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+        if chunk_seconds <= 0:
+            raise ValueError("chunk_seconds must be > 0")
+
+        audio, sample_rate = sf.read(path, dtype="float32")
+        audio = self._ensure_mono(audio)
+        if sample_rate != TARGET_SAMPLE_RATE:
+            audio = self._resample(audio, sample_rate)
+            sample_rate = TARGET_SAMPLE_RATE
+
+        chunk_frames = max(1, int(round(chunk_seconds * sample_rate)))
+        n = audio.shape[0]
+
+        try:
+            import sounddevice as sd  # noqa: WPS433
+        except ImportError as exc:  # pragma: no cover
+            if play_audio:
+                raise SystemExit(
+                    "sounddevice is required for playback. Install it with `pip install sounddevice`."
+                ) from exc
+            sd = None  # type: ignore
+
+        stream = None
+        if play_audio and sd is not None:
+            stream = sd.OutputStream(
+                samplerate=sample_rate,
+                channels=1,
+                blocksize=chunk_frames,
+                dtype="float32",
+            )
+            stream.start()
+            print("Replaying file with real-time phoneme streaming...", file=sys.stderr)
+        else:
+            print("Streaming file (silent mode)...", file=sys.stderr)
+
+        try:
+            start = 0
+            while start < n:
+                end = min(start + chunk_frames, n)
+                chunk = audio[start:end]
+                # Pad last chunk to preserve timing if playing
+                if play_audio and stream is not None and chunk.shape[0] < chunk_frames:
+                    pad_len = chunk_frames - chunk.shape[0]
+                    chunk_for_play = np.concatenate(
+                        [chunk, np.zeros(pad_len, dtype=chunk.dtype)]
+                    )
+                else:
+                    chunk_for_play = chunk
+                # Playback (blocking write ensures approximate real-time pacing)
+                if play_audio and stream is not None:
+                    stream.write(chunk_for_play.reshape(-1, 1))
+
+                # Phoneme inference on original (non-padded) chunk
+                rms = math.sqrt(float(np.mean(chunk ** 2))) if chunk.size else 0.0
+                if rms >= silence_threshold and chunk.size:
+                    text = self.transcribe_array(chunk, sample_rate).strip()
+                    if text:
+                        print(text, flush=True)
+                start = end
+        except KeyboardInterrupt:  # pragma: no cover - interactive
+            print("\nFile streaming stopped.", file=sys.stderr)
+        finally:
+            if stream is not None:
+                stream.stop(); stream.close()
+
 
 # ----------------------------------------------------------------------
 # Command-line interface
@@ -357,8 +449,11 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "mode",
-        choices=("file", "stream", "demo", "socket"),
-        help="Whether to transcribe a file, use the microphone stream, or run the demo.",
+        choices=("file", "stream", "demo", "socket", "file-stream"),
+        help=(
+            "Modes: file (offline full), stream (mic), demo (HF sample), socket (TCP mic), "
+            "file-stream (real-time file replay)."
+        ),
     )
     parser.add_argument(
         "--path",
@@ -468,6 +563,22 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             )
         except Exception as exc:  # pragma: no cover - runtime error
             print(f"Socket streaming failed: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    if args.mode == "file-stream":
+        if not args.path:
+            print("--path is required in file-stream mode", file=sys.stderr)
+            return 2
+        try:
+            recognizer.stream_file(
+                args.path,
+                chunk_seconds=args.chunk_seconds,
+                silence_threshold=args.silence_threshold,
+                play_audio=True,
+            )
+        except Exception as exc:  # pragma: no cover - runtime error
+            print(f"File streaming failed: {exc}", file=sys.stderr)
             return 1
         return 0
 
