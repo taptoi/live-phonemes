@@ -14,6 +14,7 @@ import math
 import os
 import queue
 import sys
+import socket
 from dataclasses import dataclass
 from typing import Iterable, Optional
 from datasets import load_dataset
@@ -249,6 +250,104 @@ class PhonemeRecognizer:
             except KeyboardInterrupt:
                 print("\nMicrophone streaming stopped.", file=sys.stderr)
 
+    # ------------------------------------------------------------------
+    # Socket Streaming
+    # ------------------------------------------------------------------
+    def stream_microphone_socket(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8765,
+        chunk_seconds: float = DEFAULT_MIC_CHUNK_SECONDS,
+        silence_threshold: float = DEFAULT_SILENCE_THRESHOLD,
+        reuse_addr: bool = True,
+        accept_timeout: float = 0.0,
+    ) -> None:
+        """Stream microphone phoneme output to a single TCP client.
+
+        Protocol: newline-delimited UTF-8 strings (one phoneme sequence per chunk).
+
+        Parameters
+        ----------
+        host, port: Where to bind the server (defaults: 127.0.0.1:8765)
+        chunk_seconds: Microphone chunk length in seconds.
+        silence_threshold: RMS threshold; chunks below are skipped.
+        reuse_addr: Whether to set SO_REUSEADDR.
+        accept_timeout: If > 0, socket accept will timeout allowing graceful Ctrl+C.
+        """
+        try:
+            import sounddevice as sd
+        except ImportError as exc:  # pragma: no cover
+            raise SystemExit(
+                "sounddevice is required for streaming. Install it with `pip install sounddevice`."
+            ) from exc
+
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if reuse_addr:
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if accept_timeout > 0:
+                srv.settimeout(accept_timeout)
+            srv.bind((host, port))
+            srv.listen(1)
+            print(f"Phoneme server listening on {host}:{port}", file=sys.stderr)
+
+            # Accept a single client
+            while True:
+                try:
+                    conn, addr = srv.accept()
+                    break
+                except socket.timeout:  # pragma: no cover - only if timeout used
+                    continue
+            with conn:
+                print(f"Client connected: {addr}", file=sys.stderr)
+                try:
+                    # Prepare audio stream
+                    chunk_frames = max(1, int(TARGET_SAMPLE_RATE * chunk_seconds))
+                    audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
+
+                    def callback(indata, frames, _time, status):
+                        if status:
+                            print(status, file=sys.stderr)
+                        audio_queue.put(indata.copy())
+
+                    with sd.InputStream(
+                        samplerate=TARGET_SAMPLE_RATE,
+                        channels=1,
+                        blocksize=chunk_frames,
+                        dtype="float32",
+                        callback=callback,
+                    ):
+                        print(
+                            "Streaming microphone phonemes over TCP. Ctrl+C to stop.",
+                            file=sys.stderr,
+                        )
+                        while True:
+                            chunk = audio_queue.get()
+                            if chunk.size == 0:
+                                continue
+                            mono = chunk[:, 0]
+                            rms = math.sqrt(float(np.mean(mono ** 2)))
+                            if rms < silence_threshold:
+                                continue
+                            text = self.transcribe_array(mono, TARGET_SAMPLE_RATE).strip()
+                            if not text:
+                                continue
+                            try:
+                                conn.sendall((text + "\n").encode("utf-8"))
+                                print(f"{text}", file=sys.stderr)
+                            except (BrokenPipeError, ConnectionResetError):
+                                print("Client disconnected.", file=sys.stderr)
+                                return
+                except KeyboardInterrupt:  # pragma: no cover - interactive
+                    print("\nSocket streaming stopped.", file=sys.stderr)
+                finally:
+                    try:  # attempt to signal end to client
+                        conn.shutdown(socket.SHUT_RDWR)
+                    except Exception:
+                        pass
+        finally:
+            srv.close()
+
 
 # ----------------------------------------------------------------------
 # Command-line interface
@@ -258,7 +357,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "mode",
-        choices=("file", "stream", "demo"),
+        choices=("file", "stream", "demo", "socket"),
         help="Whether to transcribe a file, use the microphone stream, or run the demo.",
     )
     parser.add_argument(
@@ -298,6 +397,17 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         type=float,
         default=DEFAULT_FILE_CHUNK_OVERLAP_SECONDS,
         help="Overlap (seconds) between file chunks (default: 0.0).",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host to bind for socket mode (default: 127.0.0.1).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Port to bind for socket mode (default: 8765).",
     )
     return parser.parse_args(argv)
 
@@ -345,6 +455,19 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             )
         except Exception as exc:  # pragma: no cover - runtime error
             print(f"Streaming failed: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    if args.mode == "socket":
+        try:
+            recognizer.stream_microphone_socket(
+                host=args.host,
+                port=args.port,
+                chunk_seconds=args.chunk_seconds,
+                silence_threshold=args.silence_threshold,
+            )
+        except Exception as exc:  # pragma: no cover - runtime error
+            print(f"Socket streaming failed: {exc}", file=sys.stderr)
             return 1
         return 0
 
