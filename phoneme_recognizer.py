@@ -18,6 +18,7 @@ import socket
 from dataclasses import dataclass
 from typing import Iterable, Optional
 from datasets import load_dataset
+from pythonosc.udp_client import SimpleUDPClient
 
 import numpy as np
 import torch
@@ -36,6 +37,22 @@ DEFAULT_SILENCE_THRESHOLD = 8e-4
 DEFAULT_FILE_CHUNK_SECONDS = 0.5  # seconds
 DEFAULT_FILE_CHUNK_OVERLAP_SECONDS = 0.0  # seconds
 
+espeak_lib_path = r"C:\Users\franc\scoop\apps\espeak-ng\current\espeak NG\libespeak-ng.dll"
+espeak_data_path = r"C:\Users\franc\scoop\apps\espeak-ng\current\espeak NG\espeak-ng-data"
+
+def configure_espeak_windows():
+    if not os.path.exists(espeak_lib_path):
+        print(f"Warning: eSpeak NG library not found at {espeak_lib_path}")
+    else:
+        os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = espeak_lib_path
+
+    if not os.path.exists(espeak_data_path):
+        print(f"Warning: eSpeak NG data folder not found at {espeak_data_path}")
+    else:
+        os.environ["ESPEAK_DATA_PATH"] = espeak_data_path
+
+if sys.platform == "win32":
+    configure_espeak_windows()
 
 def pick_device(preferred: Optional[str] = None) -> torch.device:
     """Return the most appropriate torch device for inference."""
@@ -64,21 +81,8 @@ class PhonemeRecognizer:
     def __post_init__(self) -> None:
         from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
-        try:
-            self.processor = Wav2Vec2Processor.from_pretrained(
-                self.model_name, trust_remote_code=True
-            )
-        except TypeError:
-            # Fallback for transformers versions that do not accept trust_remote_code
-            self.processor = Wav2Vec2Processor.from_pretrained(self.model_name)
-
-        try:
-            self.model = Wav2Vec2ForCTC.from_pretrained(
-                self.model_name, trust_remote_code=True
-            )
-        except TypeError:
-            # Fallback for transformers versions that do not accept trust_remote_code
-            self.model = Wav2Vec2ForCTC.from_pretrained(self.model_name)
+        self.processor = Wav2Vec2Processor.from_pretrained(self.model_name)
+        self.model = Wav2Vec2ForCTC.from_pretrained(self.model_name)
         self.model.to(self.device)
         self.model.eval()
 
@@ -262,7 +266,56 @@ class PhonemeRecognizer:
                         print(cleaned, flush=True)
             except KeyboardInterrupt:
                 print("\nMicrophone streaming stopped.", file=sys.stderr)
+    # ------------------------------------------------------------------
+    # OSC Streaming
+    # ------------------------------------------------------------------
+    def stream_microphone_osc(
+            self,
+            chunk_seconds: float = DEFAULT_MIC_CHUNK_SECONDS,
+            silence_threshold: float = DEFAULT_SILENCE_THRESHOLD,
+            osc_host: str = "127.0.0.1",
+            osc_port: int = 8000,
+            osc_address: str = "/phonemes"
+        ) -> None:
+            """Stream audio from the default microphone and send phonemes via OSC."""
+            try:
+                import sounddevice as sd
+            except ImportError as exc:
+                raise SystemExit("sounddevice is required for streaming. Install it with `pip install sounddevice`.") from exc
 
+            client = SimpleUDPClient(osc_host, osc_port)
+
+            chunk_frames = max(1, int(TARGET_SAMPLE_RATE * chunk_seconds))
+            audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
+
+            def callback(indata, frames, _time, status):
+                if status:
+                    print(status, file=sys.stderr)
+                audio_queue.put(indata.copy())
+
+            print("Starting microphone stream. Press Ctrl+C to stop.", file=sys.stderr)
+
+            with sd.InputStream(
+                samplerate=TARGET_SAMPLE_RATE,
+                channels=1,
+                blocksize=chunk_frames,
+                dtype="float32",
+                callback=callback,
+            ):
+                try:
+                    while True:
+                        chunk = audio_queue.get()
+                        if chunk.size == 0:
+                            continue
+                        chunk = chunk[:, 0]
+                        rms = math.sqrt(float(np.mean(chunk ** 2)))
+                        if rms < silence_threshold:
+                            continue
+                        transcription = self.transcribe_array(chunk, TARGET_SAMPLE_RATE).strip()
+                        if transcription:
+                            client.send_message(osc_address, transcription)
+                except KeyboardInterrupt:
+                    print("\nMicrophone streaming stopped.", file=sys.stderr)
     # ------------------------------------------------------------------
     # Socket Streaming
     # ------------------------------------------------------------------
@@ -462,9 +515,9 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "mode",
-        choices=("file", "stream", "demo", "socket", "file-stream"),
+        choices=("file", "stream", "demo", "osc", "socket", "file-stream"),
         help=(
-            "Modes: file (offline full), stream (mic), demo (HF sample), socket (TCP mic), "
+            "Modes: file (offline full), stream (mic), demo (HF sample), osc (UDP mic), socket (TCP mic), "
             "file-stream (real-time file replay)."
         ),
     )
@@ -566,6 +619,19 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             return 1
         return 0
 
+    if args.mode == "osc":
+            try:
+                recognizer.stream_microphone_osc(
+                    osc_host=args.host,
+                    osc_port=args.port,
+                    chunk_seconds=args.chunk_seconds,
+                    silence_threshold=args.silence_threshold,
+                )
+            except Exception as exc:  # pragma: no cover - runtime error
+                print(f"OSC streaming failed: {exc}", file=sys.stderr)
+                return 1
+            return 0
+    
     if args.mode == "socket":
         try:
             recognizer.stream_microphone_socket(
