@@ -64,8 +64,21 @@ class PhonemeRecognizer:
     def __post_init__(self) -> None:
         from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
-        self.processor = Wav2Vec2Processor.from_pretrained(self.model_name)
-        self.model = Wav2Vec2ForCTC.from_pretrained(self.model_name)
+        try:
+            self.processor = Wav2Vec2Processor.from_pretrained(
+                self.model_name, trust_remote_code=True
+            )
+        except TypeError:
+            # Fallback for transformers versions that do not accept trust_remote_code
+            self.processor = Wav2Vec2Processor.from_pretrained(self.model_name)
+
+        try:
+            self.model = Wav2Vec2ForCTC.from_pretrained(
+                self.model_name, trust_remote_code=True
+            )
+        except TypeError:
+            # Fallback for transformers versions that do not accept trust_remote_code
+            self.model = Wav2Vec2ForCTC.from_pretrained(self.model_name)
         self.model.to(self.device)
         self.model.eval()
 

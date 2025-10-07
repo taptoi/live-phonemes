@@ -30,6 +30,11 @@ pip install -r requirements.txt
 The script automatically downloads the pretrained model on first use and caches
 it locally using the Hugging Face transformers cache.
 
+> ⚠️ The recognizer now opts into [Hugging Face remote code execution](https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.from_pretrained.remote_code) when loading
+> the model and processor so the custom phoneme tokenizer shipped with the
+> checkpoint is used. Older `transformers` versions without the
+> `trust_remote_code` argument are still supported via a compatibility fallback.
+
 ## Usage
 
 All functionality lives in `phoneme_recognizer.py`. The script exposes three
