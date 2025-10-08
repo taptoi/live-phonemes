@@ -8,3 +8,4 @@ torchcodec
 scipy
 phonemizer
 protobuf
+python-osc

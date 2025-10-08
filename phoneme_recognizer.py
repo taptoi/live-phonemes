@@ -18,6 +18,7 @@ import socket
 from dataclasses import dataclass
 from typing import Iterable, Optional
 from datasets import load_dataset
+from pythonosc.udp_client import SimpleUDPClient
 
 import numpy as np
 import torch
@@ -29,13 +30,29 @@ except ImportError as exc:  # pragma: no cover - dependency not installed
         "soundfile is required. Install it with `pip install soundfile`."
     ) from exc
 
-MODEL_NAME = "facebook/wav2vec2-lv-60-espeak-cv-ft"
+MODEL_NAME = "./wav2vec2_model"
 TARGET_SAMPLE_RATE = 16_000
 DEFAULT_MIC_CHUNK_SECONDS = 0.6
 DEFAULT_SILENCE_THRESHOLD = 8e-4
 DEFAULT_FILE_CHUNK_SECONDS = 0.5  # seconds
 DEFAULT_FILE_CHUNK_OVERLAP_SECONDS = 0.0  # seconds
 
+espeak_lib_path = r"C:\Users\franc\scoop\apps\espeak-ng\current\espeak NG\libespeak-ng.dll"
+espeak_data_path = r"C:\Users\franc\scoop\apps\espeak-ng\current\espeak NG\espeak-ng-data"
+
+def configure_espeak_windows():
+    if not os.path.exists(espeak_lib_path):
+        print(f"Warning: eSpeak NG library not found at {espeak_lib_path}")
+    else:
+        os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = espeak_lib_path
+
+    if not os.path.exists(espeak_data_path):
+        print(f"Warning: eSpeak NG data folder not found at {espeak_data_path}")
+    else:
+        os.environ["ESPEAK_DATA_PATH"] = espeak_data_path
+
+if sys.platform == "win32":
+    configure_espeak_windows()
 
 def pick_device(preferred: Optional[str] = None) -> torch.device:
     """Return the most appropriate torch device for inference."""
@@ -249,7 +266,56 @@ class PhonemeRecognizer:
                         print(cleaned, flush=True)
             except KeyboardInterrupt:
                 print("\nMicrophone streaming stopped.", file=sys.stderr)
+    # ------------------------------------------------------------------
+    # OSC Streaming
+    # ------------------------------------------------------------------
+    def stream_microphone_osc(
+            self,
+            chunk_seconds: float = DEFAULT_MIC_CHUNK_SECONDS,
+            silence_threshold: float = DEFAULT_SILENCE_THRESHOLD,
+            osc_host: str = "127.0.0.1",
+            osc_port: int = 8000,
+            osc_address: str = "/phonemes"
+        ) -> None:
+            """Stream audio from the default microphone and send phonemes via OSC."""
+            try:
+                import sounddevice as sd
+            except ImportError as exc:
+                raise SystemExit("sounddevice is required for streaming. Install it with `pip install sounddevice`.") from exc
 
+            client = SimpleUDPClient(osc_host, osc_port)
+
+            chunk_frames = max(1, int(TARGET_SAMPLE_RATE * chunk_seconds))
+            audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
+
+            def callback(indata, frames, _time, status):
+                if status:
+                    print(status, file=sys.stderr)
+                audio_queue.put(indata.copy())
+
+            print("Starting microphone stream. Press Ctrl+C to stop.", file=sys.stderr)
+
+            with sd.InputStream(
+                samplerate=TARGET_SAMPLE_RATE,
+                channels=1,
+                blocksize=chunk_frames,
+                dtype="float32",
+                callback=callback,
+            ):
+                try:
+                    while True:
+                        chunk = audio_queue.get()
+                        if chunk.size == 0:
+                            continue
+                        chunk = chunk[:, 0]
+                        rms = math.sqrt(float(np.mean(chunk ** 2)))
+                        if rms < silence_threshold:
+                            continue
+                        transcription = self.transcribe_array(chunk, TARGET_SAMPLE_RATE).strip()
+                        if transcription:
+                            client.send_message(osc_address, transcription)
+                except KeyboardInterrupt:
+                    print("\nMicrophone streaming stopped.", file=sys.stderr)
     # ------------------------------------------------------------------
     # Socket Streaming
     # ------------------------------------------------------------------
@@ -348,6 +414,98 @@ class PhonemeRecognizer:
         finally:
             srv.close()
 
+    # ------------------------------------------------------------------
+    # File real-time streaming (audible replay + phoneme output)
+    # ------------------------------------------------------------------
+    def stream_file(
+        self,
+        path: str,
+        chunk_seconds: float = DEFAULT_MIC_CHUNK_SECONDS,
+        silence_threshold: float = DEFAULT_SILENCE_THRESHOLD,
+        play_audio: bool = True,
+    ) -> None:
+        """Replay an audio file in (approximately) real-time and stream phoneme output.
+
+        Similar to microphone streaming but pulls data from a file. Audio is optionally
+        played back so the user can hear it while phonemes are printed.
+
+        Parameters
+        ----------
+        path: str
+            Audio file path.
+        chunk_seconds: float
+            Duration of each processing chunk (defaults to microphone chunk size).
+        silence_threshold: float
+            RMS threshold below which a chunk is skipped.
+        play_audio: bool
+            If True, audibly play the audio as it's processed.
+        """
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+        if chunk_seconds <= 0:
+            raise ValueError("chunk_seconds must be > 0")
+
+        audio, sample_rate = sf.read(path, dtype="float32")
+        audio = self._ensure_mono(audio)
+        if sample_rate != TARGET_SAMPLE_RATE:
+            audio = self._resample(audio, sample_rate)
+            sample_rate = TARGET_SAMPLE_RATE
+
+        chunk_frames = max(1, int(round(chunk_seconds * sample_rate)))
+        n = audio.shape[0]
+
+        try:
+            import sounddevice as sd  # noqa: WPS433
+        except ImportError as exc:  # pragma: no cover
+            if play_audio:
+                raise SystemExit(
+                    "sounddevice is required for playback. Install it with `pip install sounddevice`."
+                ) from exc
+            sd = None  # type: ignore
+
+        stream = None
+        if play_audio and sd is not None:
+            stream = sd.OutputStream(
+                samplerate=sample_rate,
+                channels=1,
+                blocksize=chunk_frames,
+                dtype="float32",
+            )
+            stream.start()
+            print("Replaying file with real-time phoneme streaming...", file=sys.stderr)
+        else:
+            print("Streaming file (silent mode)...", file=sys.stderr)
+
+        try:
+            start = 0
+            while start < n:
+                end = min(start + chunk_frames, n)
+                chunk = audio[start:end]
+                # Pad last chunk to preserve timing if playing
+                if play_audio and stream is not None and chunk.shape[0] < chunk_frames:
+                    pad_len = chunk_frames - chunk.shape[0]
+                    chunk_for_play = np.concatenate(
+                        [chunk, np.zeros(pad_len, dtype=chunk.dtype)]
+                    )
+                else:
+                    chunk_for_play = chunk
+                # Playback (blocking write ensures approximate real-time pacing)
+                if play_audio and stream is not None:
+                    stream.write(chunk_for_play.reshape(-1, 1))
+
+                # Phoneme inference on original (non-padded) chunk
+                rms = math.sqrt(float(np.mean(chunk ** 2))) if chunk.size else 0.0
+                if rms >= silence_threshold and chunk.size:
+                    text = self.transcribe_array(chunk, sample_rate).strip()
+                    if text:
+                        print(text, flush=True)
+                start = end
+        except KeyboardInterrupt:  # pragma: no cover - interactive
+            print("\nFile streaming stopped.", file=sys.stderr)
+        finally:
+            if stream is not None:
+                stream.stop(); stream.close()
+
 
 # ----------------------------------------------------------------------
 # Command-line interface
@@ -357,8 +515,11 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "mode",
-        choices=("file", "stream", "demo", "socket"),
-        help="Whether to transcribe a file, use the microphone stream, or run the demo.",
+        choices=("file", "stream", "demo", "osc", "socket", "file-stream"),
+        help=(
+            "Modes: file (offline full), stream (mic), demo (HF sample), osc (UDP mic), socket (TCP mic), "
+            "file-stream (real-time file replay)."
+        ),
     )
     parser.add_argument(
         "--path",
@@ -458,6 +619,19 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             return 1
         return 0
 
+    if args.mode == "osc":
+            try:
+                recognizer.stream_microphone_osc(
+                    osc_host=args.host,
+                    osc_port=args.port,
+                    chunk_seconds=args.chunk_seconds,
+                    silence_threshold=args.silence_threshold,
+                )
+            except Exception as exc:  # pragma: no cover - runtime error
+                print(f"OSC streaming failed: {exc}", file=sys.stderr)
+                return 1
+            return 0
+    
     if args.mode == "socket":
         try:
             recognizer.stream_microphone_socket(
@@ -468,6 +642,22 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             )
         except Exception as exc:  # pragma: no cover - runtime error
             print(f"Socket streaming failed: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    if args.mode == "file-stream":
+        if not args.path:
+            print("--path is required in file-stream mode", file=sys.stderr)
+            return 2
+        try:
+            recognizer.stream_file(
+                args.path,
+                chunk_seconds=args.chunk_seconds,
+                silence_threshold=args.silence_threshold,
+                play_audio=True,
+            )
+        except Exception as exc:  # pragma: no cover - runtime error
+            print(f"File streaming failed: {exc}", file=sys.stderr)
             return 1
         return 0
 
