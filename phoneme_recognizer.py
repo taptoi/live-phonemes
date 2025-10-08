@@ -30,7 +30,7 @@ except ImportError as exc:  # pragma: no cover - dependency not installed
         "soundfile is required. Install it with `pip install soundfile`."
     ) from exc
 
-MODEL_NAME = "facebook/wav2vec2-lv-60-espeak-cv-ft"
+MODEL_NAME = "./wav2vec2_model"
 TARGET_SAMPLE_RATE = 16_000
 DEFAULT_MIC_CHUNK_SECONDS = 0.6
 DEFAULT_SILENCE_THRESHOLD = 8e-4
