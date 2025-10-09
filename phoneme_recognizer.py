@@ -223,14 +223,19 @@ class PhonemeRecognizer:
         self,
         chunk_seconds: float = DEFAULT_MIC_CHUNK_SECONDS,
         silence_threshold: float = DEFAULT_SILENCE_THRESHOLD,
+        input_device: int = 4
     ) -> None:
-        """Stream audio from the default microphone and print phonemes."""
+        """Stream audio from the requested input and print phonemes."""
+        import sounddevice as sd
+
         try:
-            import sounddevice as sd
-        except ImportError as exc:  # pragma: no cover - dependency not installed
-            raise SystemExit(
-                "sounddevice is required for streaming. Install it with `pip install sounddevice`."
-            ) from exc
+            device_info = sd.query_devices(input_device)  # Use the selected device index
+            device_name = device_info['name']
+
+        except ImportError as exc:
+            raise SystemExit("sounddevice is required for streaming. Install it with `pip install sounddevice`.") from exc
+
+        #print(sd.query_devices())
 
         chunk_frames = max(1, int(TARGET_SAMPLE_RATE * chunk_seconds))
         audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
@@ -245,6 +250,7 @@ class PhonemeRecognizer:
             file=sys.stderr,
         )
         with sd.InputStream(
+            device=4,
             samplerate=TARGET_SAMPLE_RATE,
             channels=1,
             blocksize=chunk_frames,
@@ -275,13 +281,20 @@ class PhonemeRecognizer:
             silence_threshold: float = DEFAULT_SILENCE_THRESHOLD,
             osc_host: str = "127.0.0.1",
             osc_port: int = 8000,
-            osc_address: str = "/phonemes"
+            osc_address: str = "/phonemes",
+            input_device: int = 4
         ) -> None:
-            """Stream audio from the default microphone and send phonemes via OSC."""
+            """Stream audio from the requested input and send phonemes via OSC."""
+            import sounddevice as sd
+
             try:
-                import sounddevice as sd
+                device_info = sd.query_devices(input_device)  # Use the selected device index
+                device_name = device_info['name']
+    
             except ImportError as exc:
                 raise SystemExit("sounddevice is required for streaming. Install it with `pip install sounddevice`.") from exc
+
+            #print(sd.query_devices())
 
             client = SimpleUDPClient(osc_host, osc_port)
 
@@ -293,9 +306,10 @@ class PhonemeRecognizer:
                     print(status, file=sys.stderr)
                 audio_queue.put(indata.copy())
 
-            print("Starting microphone stream. Press Ctrl+C to stop.", file=sys.stderr)
+            print(f"Starting microphone stream using device '{device_name}'. Press Ctrl+C to stop.", file=sys.stderr)
 
             with sd.InputStream(
+                device=4,
                 samplerate=TARGET_SAMPLE_RATE,
                 channels=1,
                 blocksize=chunk_frames,
@@ -562,13 +576,19 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--host",
         default="127.0.0.1",
-        help="Host to bind for socket mode (default: 127.0.0.1).",
+        help="Host to bind for socket or OSC mode (default: 127.0.0.1).",
     )
     parser.add_argument(
         "--port",
         type=int,
         default=8765,
-        help="Port to bind for socket mode (default: 8765).",
+        help="Port to bind for socket mode or OSC mode (default: 8765).",
+    )
+    parser.add_argument(
+        "--input-device",
+        type=int,
+        default=4,
+        help="Audio input device (default: 4).",
     )
     return parser.parse_args(argv)
 
@@ -626,6 +646,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                     osc_port=args.port,
                     chunk_seconds=args.chunk_seconds,
                     silence_threshold=args.silence_threshold,
+                    input_device=args.input_device
                 )
             except Exception as exc:  # pragma: no cover - runtime error
                 print(f"OSC streaming failed: {exc}", file=sys.stderr)
