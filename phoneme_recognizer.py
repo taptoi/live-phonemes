@@ -245,10 +245,8 @@ class PhonemeRecognizer:
                 print(status, file=sys.stderr)
             audio_queue.put(indata.copy())
 
-        print(
-            "Starting microphone stream. Press Ctrl+C to stop.",
-            file=sys.stderr,
-        )
+        print(f"Starting microphone stream using device '{device_name}'. Press Ctrl+C to stop.", file=sys.stderr)
+        
         with sd.InputStream(
             device=4,
             samplerate=TARGET_SAMPLE_RATE,
